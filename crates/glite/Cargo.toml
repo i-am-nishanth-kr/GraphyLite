@@ -1,0 +1,13 @@
+[package]
+name = "glite"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive CLI for GraphyLite"
+
+[dependencies]
+graphylite = { path = "../graphylite" }
+clap.workspace = true
+rustyline.workspace = true
+comfy-table.workspace = true
+serde_json = "1.0"
+anyhow = "1.0"

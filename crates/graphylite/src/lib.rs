@@ -96,8 +96,26 @@ impl GraphyLite {
         let rtxn = self.db.begin_read()?;
         graph::bidirectional_bfs(&rtxn, start, end, edge_type)
     }
+
+    // R6: Batch transaction support - expose db for explicit BEGIN/COMMIT
+    pub fn db(&self) -> &Arc<redb::Database> {
+        &self.db
+    }
+
+    pub fn begin_write(&self) -> Result<redb::WriteTransaction> {
+        Ok(self.db.begin_write()?)
+    }
+
+    pub fn execute_batch(&self, queries: Vec<(String, HashMap<String, Value>)>) -> Result<Vec<ExecutionResult>> {
+        let mut results = Vec::new();
+        for (q, p) in queries {
+            results.push(self.execute(q, p)?);
+        }
+        Ok(results)
+    }
 }
 
+#[derive(Debug)]
 pub struct ExecutionResult {
     pub rows: Vec<Row>,
     pub affected: usize,

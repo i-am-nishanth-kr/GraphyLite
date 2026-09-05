@@ -37,7 +37,7 @@ fn init_tables(db: &Database) -> Result<()> {
             meta.insert("next_node_id", 1u64)?;
         }
         if meta.get("next_edge_id")?.is_none() {
-            meta.insert("next_edge_id", 1u64)?;
+            meta.insert("next_edge_id", 1_000_000_000u64)?;
         }
     }
     write_txn.commit()?;
@@ -90,6 +90,52 @@ pub fn decode_label_key(bytes: &[u8]) -> Result<(String, u64)> {
     Ok((label, node_id))
 }
 
+// Prefix range helpers for efficient scans (R5)
+pub fn encode_label_prefix(label: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + label.len());
+    v.extend_from_slice(&(label.len() as u32).to_be_bytes());
+    v.extend_from_slice(label.as_bytes());
+    v
+}
+
+pub fn encode_out_prefix(src: u64) -> Vec<u8> {
+    src.to_be_bytes().to_vec()
+}
+
+pub fn encode_out_prefix_typed(src: u64, typ: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 4 + typ.len());
+    v.extend_from_slice(&src.to_be_bytes());
+    v.extend_from_slice(&(typ.len() as u32).to_be_bytes());
+    v.extend_from_slice(typ.as_bytes());
+    v
+}
+
+pub fn encode_in_prefix(dst: u64) -> Vec<u8> {
+    dst.to_be_bytes().to_vec()
+}
+
+pub fn encode_in_prefix_typed(dst: u64, typ: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 4 + typ.len());
+    v.extend_from_slice(&dst.to_be_bytes());
+    v.extend_from_slice(&(typ.len() as u32).to_be_bytes());
+    v.extend_from_slice(typ.as_bytes());
+    v
+}
+
+pub fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    // Compute exclusive upper bound by incrementing prefix as big-endian bytes
+    let mut end = prefix.to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] != 0xFF {
+            end[i] += 1;
+            end.truncate(i+1);
+            return end;
+        }
+    }
+    // If all 0xFF, return empty vec signalling no upper bound; caller should fallback to full scan
+    Vec::new()
+}
+
 pub fn serialize_node(data: &NodeData) -> Result<Vec<u8>> {
     bincode::serialize(data).map_err(|e| GliteError::Serialization(e.to_string()))
 }
@@ -112,7 +158,7 @@ pub fn next_node_id(txn: &redb::WriteTransaction) -> Result<u64> {
 }
 pub fn next_edge_id(txn: &redb::WriteTransaction) -> Result<u64> {
     let mut meta = txn.open_table(META_TABLE)?;
-    let cur = meta.get("next_edge_id")?.map(|v| v.value()).unwrap_or(1);
+    let cur = meta.get("next_edge_id")?.map(|v| v.value()).unwrap_or(1_000_000_000);
     meta.insert("next_edge_id", cur + 1)?;
     Ok(cur)
 }

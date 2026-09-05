@@ -1,6 +1,7 @@
 use crate::error::{GliteError, Result};
-use crate::storage::{IN_EDGES_TABLE, OUT_EDGES_TABLE, NODES_TABLE, EDGES_TABLE, decode_out_key};
+use crate::storage::{IN_EDGES_TABLE, OUT_EDGES_TABLE, NODES_TABLE, EDGES_TABLE};
 use crate::types::{Edge, Node};
+#[allow(unused_imports)]
 use redb::ReadableTable;
 use std::collections::{HashMap, HashSet, VecDeque, BinaryHeap};
 use std::cmp::Ordering;
@@ -32,16 +33,30 @@ fn outgoing_edges(txn: &redb::ReadTransaction, src: u64, edge_type: Option<&str>
     let edge_ids: Vec<u64> = {
         let table = txn.open_table(OUT_EDGES_TABLE)?;
         let mut ids = vec![];
-        for entry in table.iter()? {
-            let (k, v) = entry?;
-            let key_bytes = k.value();
-            let edge_id = v.value();
-            let (s, typ, _dst) = decode_out_key(key_bytes)?;
-            if s != src { continue; }
-            if let Some(filter) = edge_type {
-                if typ != filter { continue; }
+        if let Some(filter) = edge_type {
+            let prefix = crate::storage::encode_out_prefix_typed(src, filter);
+            let end = crate::storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(table.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(table.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter {
+                let ( _k, v) = entry?;
+                ids.push(v.value());
             }
-            ids.push(edge_id);
+        } else {
+            let prefix = crate::storage::encode_out_prefix(src);
+            let end = crate::storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(table.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(table.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter {
+                let ( _k, v) = entry?;
+                ids.push(v.value());
+            }
         }
         ids
     };
@@ -56,15 +71,30 @@ fn incoming_edges(txn: &redb::ReadTransaction, dst: u64, edge_type: Option<&str>
     let edge_ids: Vec<u64> = {
         let table = txn.open_table(IN_EDGES_TABLE)?;
         let mut ids = vec![];
-        for entry in table.iter()? {
-            let (k, v) = entry?;
-            let key_bytes = k.value();
-            let (d, typ, _src) = crate::storage::decode_out_key(key_bytes)?;
-            if d != dst { continue; }
-            if let Some(filter) = edge_type {
-                if typ != filter { continue; }
+        if let Some(filter) = edge_type {
+            let prefix = crate::storage::encode_in_prefix_typed(dst, filter);
+            let end = crate::storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(table.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(table.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter {
+                let ( _k, v) = entry?;
+                ids.push(v.value());
             }
-            ids.push(v.value());
+        } else {
+            let prefix = crate::storage::encode_in_prefix(dst);
+            let end = crate::storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(table.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(table.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter {
+                let ( _k, v) = entry?;
+                ids.push(v.value());
+            }
         }
         ids
     };
@@ -249,43 +279,42 @@ pub fn bidirectional_bfs(txn: &redb::ReadTransaction, start: u64, end: u64, edge
 
     if let Some(mid) = meeting {
         // Reconstruct forward part start->mid
-        let mut fwd_nodes = vec![];
-        let mut fwd_edges = vec![];
         let mut cur = mid;
-        let mut rev_nodes = vec![fetch_node(txn, cur)?.unwrap()];
+        let mut rev_nodes = vec![fetch_node(txn, cur)?.ok_or(GliteError::NotFound(format!("node {}", cur)))?];
         let mut rev_edges = vec![];
         while cur != start {
             let (prev, e) = parent_fwd.get(&cur).cloned().ok_or(GliteError::Execution("bidirectional parent_fwd missing".into()))?;
             rev_edges.push(e);
             cur = prev;
-            rev_nodes.push(fetch_node(txn, cur)?.unwrap());
+            rev_nodes.push(fetch_node(txn, cur)?.ok_or(GliteError::NotFound(format!("node {}", cur)))?);
         }
         rev_nodes.reverse();
         rev_edges.reverse();
-        fwd_nodes = rev_nodes;
-        fwd_edges = rev_edges;
+        let mut fwd_nodes = rev_nodes;
+        let mut fwd_edges = rev_edges;
 
-        // Reconstruct backward part mid->end
-        // parent_bwd stores mapping nbr -> (cur, edge) where cur is successor towards end
-        // So we need to walk from mid to end using bwd parents forward? Actually bwd search expands from end backwards, so parent points towards end
-        let mut cur2 = mid;
-        while cur2 != end {
-            // Find child of cur2 that is closer to end? In our bwd map, we stored parent as (cur, edge) where cur is the node we came from (closer to end)
-            // To traverse forward from mid to end, we need to find the successor.
-            // Simpler: we have visited_bwd keys are predecessors. For node cur2, its successor is the entry where key's parent is cur? Wait.
-            // Let's brute: find any entry where parent's first == cur2? No.
-            // Alternative approach: reconstruct bwd path by walking from mid backwards? We have mapping from node -> (next towards end, edge)
-            // Actually when we did bwd BFS, we inserted nbr with parent (cur, edge) where edge is nbr->cur (since we traversed incoming edges from cur, nbr is predecessor)
-            // So to go from mid to end, we need to follow parent chain: mid's successor is ... but parent_bwd[mid] would be stored if mid was discovered from predecessor? Hmm confusion.
-            // Let's instead reconstruct via walking from end backwards to mid using parent_bwd inverse, then reverse.
-            break;
+        // Reconstruct backward part mid->end via parent_bwd forward chain (mid -> successor -> ... -> end)
+        // parent_bwd maps node -> (successor towards end, edge)
+        if mid != end {
+            let mut cur2 = mid;
+            let mut bwd_nodes = Vec::new();
+            let mut bwd_edges = Vec::new();
+            let mut steps = 0usize;
+            // Guard against infinite loops (graph cycles)
+            while cur2 != end {
+                if steps > 10000 {
+                    return Err(GliteError::Execution("bidirectional reconstruction loop".into()));
+                }
+                let (next, edge) = parent_bwd.get(&cur2).cloned().ok_or(GliteError::Execution(format!("bidirectional parent_bwd missing for {}", cur2)))?;
+                bwd_edges.push(edge);
+                cur2 = next;
+                bwd_nodes.push(fetch_node(txn, cur2)?.ok_or(GliteError::NotFound(format!("node {}", cur2)))?);
+                steps += 1;
+            }
+            fwd_nodes.extend(bwd_nodes);
+            fwd_edges.extend(bwd_edges);
         }
-        // For correctness, simpler to fallback to normal BFS if bidirectional reconstruction complex.
-        // We'll just call normal BFS for now if meeting needed more logic.
-        // To avoid complexity, if bidirectional_meeting found, just run BFS to return path (still correct, albeit not using parent maps fully)
-        // But we have already found meeting quickly, we can simply run BFS now? That defeats optimization but still returns correct answer.
-        // Let's return BFS result instead
-        return bfs_shortest_path(txn, start, end, edge_type, crate::parser::Direction::Outgoing);
+        return Ok(Some((fwd_nodes, fwd_edges)));
     }
     Ok(None)
 }

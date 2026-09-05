@@ -5,6 +5,7 @@ use crate::types::{Edge, Node, NodeData, EdgeData, Row, Value, PathResult};
 use redb::ReadableTable;
 use std::collections::HashMap;
 
+#[derive(Debug)]
 pub struct ExecutionResult {
     pub rows: Vec<Row>,
     pub affected: usize,
@@ -17,85 +18,128 @@ pub fn execute_write(db: &redb::Database, pq: ParsedQuery, params: &HashMap<Stri
     let mut affected = 0usize;
     let mut rows = vec![];
 
-    // Handle CREATE
-    for create in &pq.creates {
-        for path in &create.paths {
-            let mut var_to_id: HashMap<String, u64> = HashMap::new();
-            // Create nodes first
-            for node_pat in &path.nodes {
-                // Check if node variable already created in this path? We'll create new node per pattern node, but if variable reused? For MVP create new
-                let mut props = HashMap::new();
-                for (k, expr) in &node_pat.properties {
-                    let v = eval_expr(expr, params)?;
-                    props.insert(k.clone(), v);
-                }
-                let node_data = NodeData{ labels: node_pat.labels.clone(), properties: props };
-                let bytes = storage::serialize_node(&node_data)?;
-                let nid = storage::next_node_id(&write_txn)?;
-                {
-                    let mut tbl = write_txn.open_table(NODES_TABLE)?;
-                    tbl.insert(nid, bytes.as_slice())?;
-                }
-                {
-                    let mut lbl_tbl = write_txn.open_table(LABEL_INDEX_TABLE)?;
-                    for lbl in &node_pat.labels {
-                        let key = storage::encode_label_key(lbl, nid);
-                        lbl_tbl.insert(key.as_slice(), nid)?;
+    // Handle CREATE with reuse support (R1)
+    // - var_to_id persists across all CREATE paths within same query
+    // - if MATCH bindings exist, CREATE reuses matched node ids (e.g., MATCH (a),(b) CREATE (a)-[:KNOWS]->(b))
+    if !pq.creates.is_empty() {
+        // Determine base bindings from MATCH to seed CREATE reuse
+        let base_bindings: Vec<HashMap<String, u64>> = if !pq.matches.is_empty() || pq.shortest_path.is_some() {
+            let b = find_matches_write(&write_txn, &pq, params)?;
+            if b.is_empty() { vec![HashMap::new()] } else { b }
+        } else {
+            vec![HashMap::new()]
+        };
+
+        // For each base binding, execute all CREATE paths sharing the same var_to_id map.
+        // This enables MATCH+CREATE cross-product edge creation.
+        let mut all_create_maps: Vec<HashMap<String, u64>> = Vec::new();
+        for base in &base_bindings {
+            let mut var_to_id: HashMap<String, u64> = base.clone();
+            for create in &pq.creates {
+                for path in &create.paths {
+                    // Track node ids created in this path in order for edge resolution fallback
+                    let mut path_node_ids: Vec<u64> = Vec::new();
+                    for node_pat in &path.nodes {
+                        if let Some(var) = &node_pat.variable {
+                            if var_to_id.contains_key(var) {
+                                // Reuse existing node (MATCH+CREATE or intra-query reuse)
+                                // Path still needs id for edge creation ordering
+                                let existing = *var_to_id.get(var).unwrap();
+                                path_node_ids.push(existing);
+                                // Optional: if properties specified with reuse, treat as additional props update?
+                                // For now skip creation to avoid duplicate (R1 fix)
+                                continue;
+                            }
+                        }
+                        // Create new node
+                        let mut props = HashMap::new();
+                        for (k, expr) in &node_pat.properties {
+                            let v = eval_expr(expr, params)?;
+                            props.insert(k.clone(), v);
+                        }
+                        let node_data = NodeData{ labels: node_pat.labels.clone(), properties: props };
+                        let bytes = storage::serialize_node(&node_data)?;
+                        let nid = storage::next_node_id(&write_txn)?;
+                        {
+                            let mut tbl = write_txn.open_table(NODES_TABLE)?;
+                            tbl.insert(nid, bytes.as_slice())?;
+                        }
+                        {
+                            let mut lbl_tbl = write_txn.open_table(LABEL_INDEX_TABLE)?;
+                            for lbl in &node_pat.labels {
+                                let key = storage::encode_label_key(lbl, nid);
+                                lbl_tbl.insert(key.as_slice(), nid)?;
+                            }
+                        }
+                        if let Some(var) = &node_pat.variable {
+                            var_to_id.insert(var.clone(), nid);
+                        }
+                        path_node_ids.push(nid);
+                        affected += 1;
+                    }
+                    // Create edges for this path
+                    for (idx, edge_pat) in path.edges.iter().enumerate() {
+                        // Resolve src/dst: prefer variable lookup, fallback to positional path_node_ids
+                        let src_node_pat = &path.nodes[idx];
+                        let dst_node_pat = &path.nodes[idx+1];
+                        let src_id = if let Some(sv) = &src_node_pat.variable {
+                            if let Some(id) = var_to_id.get(sv) { *id } else { path_node_ids[idx] }
+                        } else {
+                            path_node_ids[idx]
+                        };
+                        let dst_id = if let Some(dv) = &dst_node_pat.variable {
+                            if let Some(id) = var_to_id.get(dv) { *id } else { path_node_ids[idx+1] }
+                        } else {
+                            path_node_ids[idx+1]
+                        };
+                        // Ensure nodes were resolved
+                        if path_node_ids.is_empty() {
+                            return Err(GliteError::Execution("edge source/target unresolved".into()));
+                        }
+                        let mut props = HashMap::new();
+                        for (k, expr) in &edge_pat.properties {
+                            let v = eval_expr(expr, params)?;
+                            props.insert(k.clone(), v);
+                        }
+                        let edge_type = edge_pat.edge_type.clone().unwrap_or_else(|| "RELATED".to_string());
+                        let edge_data = EdgeData{ src: src_id, dst: dst_id, edge_type: edge_type.clone(), properties: props };
+                        let bytes = storage::serialize_edge(&edge_data)?;
+                        let eid = storage::next_edge_id(&write_txn)?;
+                        {
+                            let mut etbl = write_txn.open_table(EDGES_TABLE)?;
+                            etbl.insert(eid, bytes.as_slice())?;
+                        }
+                        {
+                            let mut out = write_txn.open_table(OUT_EDGES_TABLE)?;
+                            let key = storage::encode_out_key(src_id, &edge_type, dst_id);
+                            out.insert(key.as_slice(), eid)?;
+                        }
+                        {
+                            let mut inn = write_txn.open_table(IN_EDGES_TABLE)?;
+                            let key = storage::encode_in_key(dst_id, &edge_type, src_id);
+                            inn.insert(key.as_slice(), eid)?;
+                        }
+                        if let Some(v) = &edge_pat.variable {
+                            var_to_id.insert(v.clone(), eid);
+                        }
+                        affected += 1;
                     }
                 }
-                if let Some(var) = &node_pat.variable {
-                    var_to_id.insert(var.clone(), nid);
-                }
-                affected += 1;
             }
-            // Create edges
-            for (idx, edge_pat) in path.edges.iter().enumerate() {
-                let src_node_pat = &path.nodes[idx];
-                let dst_node_pat = &path.nodes[idx+1];
-                let src_var = src_node_pat.variable.as_ref().ok_or(GliteError::Parse("edge source node must have variable".into()))?;
-                let dst_var = dst_node_pat.variable.as_ref().ok_or(GliteError::Parse("edge target node must have variable".into()))?;
-                let src_id = *var_to_id.get(src_var).ok_or(GliteError::Execution(format!("unknown var {}", src_var)))?;
-                let dst_id = *var_to_id.get(dst_var).ok_or(GliteError::Execution(format!("unknown var {}", dst_var)))?;
-                let mut props = HashMap::new();
-                for (k, expr) in &edge_pat.properties {
-                    let v = eval_expr(expr, params)?;
-                    props.insert(k.clone(), v);
-                }
-                let edge_type = edge_pat.edge_type.clone().unwrap_or_else(|| "RELATED".to_string());
-                let edge_data = EdgeData{ src: src_id, dst: dst_id, edge_type: edge_type.clone(), properties: props };
-                let bytes = storage::serialize_edge(&edge_data)?;
-                let eid = storage::next_edge_id(&write_txn)?;
-                {
-                    let mut etbl = write_txn.open_table(EDGES_TABLE)?;
-                    etbl.insert(eid, bytes.as_slice())?;
-                }
-                {
-                    let mut out = write_txn.open_table(OUT_EDGES_TABLE)?;
-                    let key = storage::encode_out_key(src_id, &edge_type, dst_id);
-                    out.insert(key.as_slice(), eid)?;
-                }
-                {
-                    let mut inn = write_txn.open_table(IN_EDGES_TABLE)?;
-                    let key = storage::encode_in_key(dst_id, &edge_type, src_id);
-                    inn.insert(key.as_slice(), eid)?;
-                }
-                if let Some(v) = &edge_pat.variable {
-                    var_to_id.insert(v.clone(), eid); // though edge ids are in same space? Not: node ids vs edge ids separate but variable mapping expects distinction
-                }
-                affected += 1;
-            }
-            // If RETURN after CREATE, we need to produce rows (simple: return created nodes if requested)
-            if let Some(ret) = &pq.returns {
-                // For MVP, if RETURN exists create rows with created vars
+            all_create_maps.push(var_to_id);
+        }
+        // Handle RETURN after CREATE (one row per created binding)
+        if let Some(ret) = &pq.returns {
+            for var_to_id in &all_create_maps {
                 let mut row = Row::new();
                 for item in &ret.items {
                     match &item.expr {
                         ReturnExpr::Variable(var) => {
                             if let Some(id) = var_to_id.get(var) {
                                 if let Some(node) = fetch_node_write(&write_txn, *id)? {
-                                    row.nodes.insert(var.clone(), node);
+                                    row.nodes.insert(item.alias.clone().unwrap_or_else(|| var.clone()), node);
                                 } else if let Some(edge) = fetch_edge_write(&write_txn, *id)? {
-                                    row.edges.insert(var.clone(), edge);
+                                    row.edges.insert(item.alias.clone().unwrap_or_else(|| var.clone()), edge);
                                 }
                             }
                         },
@@ -114,14 +158,70 @@ pub fn execute_write(db: &redb::Database, pq: ParsedQuery, params: &HashMap<Stri
                                 }
                             }
                         },
+                        ReturnExpr::Count(var) => {
+                            let key = item.alias.clone().unwrap_or_else(|| format!("count({})", var));
+                            row.values.insert(key, Value::Integer(1));
+                        },
                         _ => {}
                     }
                 }
-                if !row.nodes.is_empty() || !row.values.is_empty() || !row.edges.is_empty() {
-                    rows.push(row);
+                if !row.nodes.is_empty() || !row.values.is_empty() || !row.edges.is_empty() || !ret.items.is_empty() {
+                    // For count aggregation need later handling, push per-binding row for now
+                    if ret.items.iter().any(|i| matches!(i.expr, ReturnExpr::Count(_))) {
+                        rows.push(row);
+                    } else if !row.nodes.is_empty() || !row.values.is_empty() || !row.edges.is_empty() {
+                        rows.push(row);
+                    } else if all_create_maps.len()==1 {
+                        // empty return not pushing unless needed
+                    }
                 }
             }
+            // aggregate COUNT if present
+            if ret.items.iter().any(|i| matches!(i.expr, ReturnExpr::Count(_))) && !rows.is_empty() {
+                let cnt = rows.len() as i64;
+                let mut agg = Row::new();
+                for item in &ret.items {
+                    if let ReturnExpr::Count(var) = &item.expr {
+                        let key = item.alias.clone().unwrap_or_else(|| format!("count({})", var));
+                        agg.values.insert(key, Value::Integer(cnt));
+                    }
+                }
+                rows = vec![agg];
+            } else if ret.items.iter().any(|i| matches!(i.expr, ReturnExpr::Count(_))) && rows.is_empty() && !all_create_maps.is_empty() {
+                let cnt = all_create_maps.len() as i64;
+                let mut agg = Row::new();
+                for item in &ret.items {
+                    if let ReturnExpr::Count(var)=&item.expr {
+                        let key = item.alias.clone().unwrap_or_else(|| format!("count({})", var));
+                        agg.values.insert(key, Value::Integer(cnt));
+                    }
+                }
+                rows = vec![agg];
+            }
+            // If CREATE+RETURN already produced rows, commit and return early (skip generic MATCH+SET/DELETE return duplication)
+            if !rows.is_empty() || !pq.sets.is_empty() || !pq.deletes.is_empty() {
+                // If there are also SET/DELETEs, fall through to handle them (but avoid double RETURN for MATCH-only)
+                if pq.sets.is_empty() && pq.deletes.is_empty() && !base_bindings.is_empty() && !pq.matches.is_empty() && pq.creates.len()>0 {
+                    // For MATCH+CREATE+RETURN case, we already produced RETURN rows; if original logic would also produce rows
+                    // we need to prevent duplicate. We'll override later handling by marking creates handled.
+                }
+            }
+            if pq.sets.is_empty() && pq.deletes.is_empty() && pq.returns.is_some() {
+                // Pure CREATE (or MATCH+CREATE) with RETURN: we have rows, can commit now unless SET/DELETE pending
+                // But to allow MATCH+CREATE without RETURN to continue for SET, we check.
+                // If no SET/DELETE, commit early.
+                write_txn.commit()?;
+                return Ok(ExecutionResult{ rows, affected });
+            }
+        } else {
+            // No RETURN after CREATE but CREATE executed; if no SET/DELETE, commit and return
+            if pq.sets.is_empty() && pq.deletes.is_empty() && pq.returns.is_none() {
+                write_txn.commit()?;
+                return Ok(ExecutionResult{ rows, affected });
+            }
         }
+        // If we have SET/DELETE together with CREATE+MATCH, fall through to generic handling below
+        // Need to keep affected/rows accumulated; generic handling will append further.
     }
 
     // Handle MATCH + WHERE + SET/DELETE + RETURN for write transactions as well (if match exists without create)
@@ -565,7 +665,7 @@ fn find_bindings_for_path_read(txn: &redb::ReadTransaction, path: &crate::parser
 
     // Step 1: candidate nodes for first pattern node
     let first = &path.nodes[0];
-    let mut candidates = candidate_nodes_read(txn, first, params)?;
+    let candidates = candidate_nodes_read(txn, first, params)?;
 
     let mut results: Vec<HashMap<String, u64>> = vec![];
     for (nid, _node) in candidates {
@@ -604,8 +704,10 @@ fn find_bindings_for_path_read(txn: &redb::ReadTransaction, path: &crate::parser
             // Simplify: if is_variable_length, we do BFS to find all reachable nodes matching next_node_pat within some depth (e.g., up to 10 or unlimited until graph exhausted)
             // We'll handle variable length specially.
             if edge_pat.is_variable_length {
-                // BFS from current_node_id to find all nodes matching next_node_pat
-                let reachable = bfs_variable_length(txn, current_node_id, edge_pat.edge_type.as_deref(), edge_pat.direction.clone(), next_node_pat, params)?;
+                // BFS from current_node_id to find all nodes matching next_node_pat with formalized bounds
+                let min = edge_pat.var_len_min.unwrap_or(1);
+                let max = edge_pat.var_len_max.unwrap_or(10);
+                let reachable = bfs_variable_length(txn, current_node_id, edge_pat.edge_type.as_deref(), edge_pat.direction.clone(), next_node_pat, params, min, max)?;
                 if reachable.is_empty() { path_ok = false; break; }
                 // For MVP, variable length in MATCH returns multiple bindings (each reachable node)
                 // We need to branch results: for each reachable (node_id, edge_path) create a new binding fork
@@ -725,11 +827,16 @@ fn candidate_nodes_read(txn: &redb::ReadTransaction, pat: &crate::parser::Patter
         let ids: Vec<u64> = {
             let tbl = txn.open_table(LABEL_INDEX_TABLE)?;
             let mut ids = vec![];
-            for entry in tbl.iter()? {
-                let (k,v) = entry?;
-                let (lbl, nid) = storage::decode_label_key(k.value())?;
-                if lbl == *label { ids.push(nid); }
-                let _ = v;
+            let prefix = storage::encode_label_prefix(label);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter {
+                let (_k, v) = entry?;
+                ids.push(v.value());
             }
             ids
         };
@@ -783,12 +890,24 @@ fn get_out_edges_read(txn: &redb::ReadTransaction, src: u64, typ: Option<&str>) 
     let ids: Vec<u64> = {
         let tbl = txn.open_table(OUT_EDGES_TABLE)?;
         let mut ids = vec![];
-        for entry in tbl.iter()? {
-            let (k, v) = entry?;
-            let (s, t, _d) = storage::decode_out_key(k.value())?;
-            if s != src { continue; }
-            if let Some(filter)=typ { if t != filter { continue; } }
-            ids.push(v.value());
+        if let Some(filter) = typ {
+            let prefix = storage::encode_out_prefix_typed(src, filter);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter { let (_, v) = entry?; ids.push(v.value()); }
+        } else {
+            let prefix = storage::encode_out_prefix(src);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter { let (_, v) = entry?; ids.push(v.value()); }
         }
         ids
     };
@@ -800,12 +919,24 @@ fn get_in_edges_read(txn: &redb::ReadTransaction, dst: u64, typ: Option<&str>) -
     let ids: Vec<u64> = {
         let tbl = txn.open_table(IN_EDGES_TABLE)?;
         let mut ids = vec![];
-        for entry in tbl.iter()? {
-            let (k,v) = entry?;
-            let (d, t, _s) = storage::decode_out_key(k.value())?;
-            if d != dst { continue; }
-            if let Some(filter)=typ { if t != filter { continue; } }
-            ids.push(v.value());
+        if let Some(filter) = typ {
+            let prefix = storage::encode_in_prefix_typed(dst, filter);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter { let (_, v) = entry?; ids.push(v.value()); }
+        } else {
+            let prefix = storage::encode_in_prefix(dst);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter { let (_, v) = entry?; ids.push(v.value()); }
         }
         ids
     };
@@ -844,7 +975,25 @@ fn eval_where_read(txn: &redb::ReadTransaction, binding: &HashMap<String, u64>, 
 
 fn compare_values(left: Option<&Value>, right: Option<&Value>, op: &crate::parser::Operator) -> bool {
     match (left, right) {
+        (Some(Value::Null), Some(Value::Null)) => matches!(op, crate::parser::Operator::Eq | crate::parser::Operator::Gte | crate::parser::Operator::Lte),
+        (Some(Value::Null), _) | (_, Some(Value::Null)) => {
+            match op {
+                crate::parser::Operator::Eq => false,
+                crate::parser::Operator::NotEq => true,
+                _ => false,
+            }
+        },
         (Some(l), Some(r)) => {
+            // Handle NaN: any comparison with NaN is false except NotEq true
+            if let (Value::Float(af), Value::Float(bf)) = (l, r) {
+                if af.is_nan() || bf.is_nan() {
+                    return match op {
+                        crate::parser::Operator::NotEq => true,
+                        crate::parser::Operator::Eq => false,
+                        _ => false,
+                    };
+                }
+            }
             match op {
                 crate::parser::Operator::Eq => l==r,
                 crate::parser::Operator::NotEq => l!=r,
@@ -867,17 +1016,23 @@ fn compare_values(left: Option<&Value>, right: Option<&Value>, op: &crate::parse
 fn cmp_order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a,b) {
         (Value::Integer(ai), Value::Integer(bi)) => Some(ai.cmp(bi)),
-        (Value::Float(af), Value::Float(bf)) => af.partial_cmp(bf),
-        (Value::Integer(ai), Value::Float(bf)) => (*ai as f64).partial_cmp(bf),
-        (Value::Float(af), Value::Integer(bi)) => af.partial_cmp(&(*bi as f64)),
+        (Value::Float(af), Value::Float(bf)) => {
+            if af.is_nan() || bf.is_nan() { None } else { af.partial_cmp(bf) }
+        },
+        (Value::Integer(ai), Value::Float(bf)) => {
+            if bf.is_nan() { None } else { (*ai as f64).partial_cmp(bf) }
+        },
+        (Value::Float(af), Value::Integer(bi)) => {
+            if af.is_nan() { None } else { af.partial_cmp(&(*bi as f64)) }
+        },
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
         _ => None,
     }
 }
 
-// BFS for variable length [*]
-fn bfs_variable_length(txn: &redb::ReadTransaction, start: u64, edge_type: Option<&str>, direction: Direction, target_pat: &crate::parser::PatternNode, params: &HashMap<String, Value>) -> Result<Vec<(u64, Vec<Edge>)>> {
+// BFS for variable length [*] with formalized bounds
+fn bfs_variable_length(txn: &redb::ReadTransaction, start: u64, edge_type: Option<&str>, direction: Direction, target_pat: &crate::parser::PatternNode, params: &HashMap<String, Value>, min: usize, max: usize) -> Result<Vec<(u64, Vec<Edge>)>> {
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
     visited.insert(start);
@@ -896,16 +1051,20 @@ fn bfs_variable_length(txn: &redb::ReadTransaction, start: u64, edge_type: Optio
             if visited.contains(&nbr) { continue; }
             let mut new_path = path.clone();
             new_path.push(edge);
-            // Check if nbr matches target pattern
-            if let Some(node) = fetch_node_read(txn, nbr)? {
-                if labels_match(&node.labels, &target_pat.labels) && props_match(&node.properties, &target_pat.properties, params)? {
-                    results.push((nbr, new_path.clone()));
-                    // continue searching beyond? For shortest, we might want all reachable but limit depth; for now continue to find further
+            let len = new_path.len();
+            // Check if nbr matches target pattern and length within bounds
+            if len >= min && len <= max {
+                if let Some(node) = fetch_node_read(txn, nbr)? {
+                    if labels_match(&node.labels, &target_pat.labels) && props_match(&node.properties, &target_pat.properties, params)? {
+                        results.push((nbr, new_path.clone()));
+                    }
                 }
+            } else if len < min {
+                // still need to check? If len < min, don't push even if matches, but continue expanding
+                // No push
             }
             visited.insert(nbr);
-            // Limit depth to avoid explosion: e.g., max 10 hops or 100 nodes
-            if new_path.len() < 10 {
+            if len < max {
                 queue.push_back((nbr, new_path));
             }
         }
@@ -1037,11 +1196,19 @@ fn candidate_nodes_write(txn: &redb::WriteTransaction, pat: &crate::parser::Patt
     if !pat.labels.is_empty() {
         let ids: Vec<u64> = {
             let tbl = txn.open_table(LABEL_INDEX_TABLE)?;
-            tbl.iter()?.filter_map(|e| {
-                let (k,_v)=e.ok()?;
-                let (lbl,nid)=storage::decode_label_key(k.value()).ok()?;
-                if lbl==*pat.labels[0] { Some(nid) } else { None }
-            }).collect()
+            let mut ids = vec![];
+            let prefix = storage::encode_label_prefix(&pat.labels[0]);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter {
+                let (_, v) = entry?;
+                ids.push(v.value());
+            }
+            ids
         };
         for nid in ids {
             if let Some(node)=fetch_node_write(txn, nid)? {
@@ -1099,12 +1266,24 @@ fn get_out_edges_write(txn: &redb::WriteTransaction, src: u64, typ: Option<&str>
     let ids: Vec<u64> = {
         let tbl = txn.open_table(OUT_EDGES_TABLE)?;
         let mut ids = vec![];
-        for entry in tbl.iter()? {
-            let (k, v)=entry?;
-            let (s, t, _d)=storage::decode_out_key(k.value())?;
-            if s!=src { continue; }
-            if let Some(f)=typ { if t!=f { continue; } }
-            ids.push(v.value());
+        if let Some(f)=typ {
+            let prefix = storage::encode_out_prefix_typed(src, f);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter { let (_, v)=entry?; ids.push(v.value()); }
+        } else {
+            let prefix = storage::encode_out_prefix(src);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter { let (_, v)=entry?; ids.push(v.value()); }
         }
         ids
     };
@@ -1116,12 +1295,24 @@ fn get_in_edges_write(txn: &redb::WriteTransaction, dst: u64, typ: Option<&str>)
     let ids: Vec<u64> = {
         let tbl = txn.open_table(IN_EDGES_TABLE)?;
         let mut ids = vec![];
-        for entry in tbl.iter()? {
-            let (k,v)=entry?;
-            let (d,t,_s)=storage::decode_out_key(k.value())?;
-            if d!=dst { continue; }
-            if let Some(f)=typ { if t!=f { continue; } }
-            ids.push(v.value());
+        if let Some(f)=typ {
+            let prefix = storage::encode_in_prefix_typed(dst, f);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter { let (_, v)=entry?; ids.push(v.value()); }
+        } else {
+            let prefix = storage::encode_in_prefix(dst);
+            let end = storage::prefix_end(&prefix);
+            let iter: Box<dyn Iterator<Item=std::result::Result<_, redb::StorageError>> + '_> = if end.is_empty() {
+                Box::new(tbl.range(prefix.as_slice()..)?)
+            } else {
+                Box::new(tbl.range(prefix.as_slice()..end.as_slice())?)
+            };
+            for entry in iter { let (_, v)=entry?; ids.push(v.value()); }
         }
         ids
     };

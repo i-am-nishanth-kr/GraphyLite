@@ -99,7 +99,48 @@ fn main() -> anyhow::Result<()> {
                             }
                         },
                         ".help" => {
-                            println!("Dot commands: .tables .labels .schema .mode table|json|csv .timer on|off .exit .help");
+                            println!("Dot commands: .tables .labels .schema .mode table|json|csv .timer on|off .import <file> .export <file> .exit .help");
+                        },
+                        ".import" => {
+                            if parts.len() < 2 { eprintln!("usage: .import <file>"); } else {
+                                let path = parts[1..].join(" ");
+                                match std::fs::read_to_string(&path) {
+                                    Ok(content) => {
+                                        let mut ok = 0; let mut fail = 0;
+                                        for stmt in content.split(';') {
+                                            let s = stmt.trim();
+                                            if s.is_empty() { continue; }
+                                            match db.execute(s, HashMap::new()) {
+                                                Ok(r) => { println!("OK {} affected", r.affected); ok+=1; },
+                                                Err(e) => { eprintln!("Error: {}", e); fail+=1; },
+                                            }
+                                        }
+                                        println!("import done: {} ok, {} failed", ok, fail);
+                                    },
+                                    Err(e) => eprintln!("import error: {}", e),
+                                }
+                            }
+                        },
+                        ".export" => {
+                            if parts.len() < 2 { eprintln!("usage: .export <file>"); } else {
+                                let path = parts[1..].join(" ");
+                                let mut out = Vec::new();
+                                // Export schema
+                                if let Ok(s) = db.schema() { out.push(s); }
+                                // Export nodes sample: MATCH (n) RETURN n
+                                match db.execute("MATCH (n) RETURN n", HashMap::new()) {
+                                    Ok(r) => {
+                                        for row in r.rows {
+                                            for (k,n) in row.nodes { out.push(format!("Node {} {:?} {:?}", k, n.labels, n.properties)); }
+                                        }
+                                    },
+                                    Err(e) => eprintln!("export query error: {}", e),
+                                }
+                                match std::fs::write(&path, out.join("\n")) {
+                                    Ok(_) => println!("exported to {:?}", path),
+                                    Err(e) => eprintln!("export error: {}", e),
+                                }
+                            }
                         },
                         _ => eprintln!("unknown dot command: {}", parts[0]),
                     }
@@ -199,6 +240,7 @@ fn handle_query(db: &GraphyLite, query: &str, mode: &mut OutputMode, timer: bool
             }
             let cols: Vec<String> = cols.into_iter().collect();
             let mut table = Table::new();
+            table.load_preset(comfy_table::presets::UTF8_FULL);
             table.set_content_arrangement(ContentArrangement::Dynamic);
             table.set_header(cols.clone());
             for row in &result.rows {

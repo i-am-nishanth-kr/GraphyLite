@@ -29,6 +29,8 @@ pub struct PatternEdge {
     pub properties: HashMap<String, Expr>,
     pub direction: Direction,
     pub is_variable_length: bool, // for [*] syntax
+    pub var_len_min: Option<usize>,
+    pub var_len_max: Option<usize>,
     pub weight_property: Option<String>, // for Dijkstra weight
 }
 
@@ -147,15 +149,24 @@ pub struct ParsedQuery {
 // ---------- Parser implementation ----------
 
 pub fn parse_query(input: &str, params: &HashMap<String, Value>) -> Result<ParsedQuery> {
-    // Validate with decypher first (optional, for pipeline compliance)
-    if let Err(e) = decypher::parse(input) {
-        // Don't hard fail; our custom parser will attempt. But log error
-        // We still return parse error if our parser also fails
-        let _ = e;
-    }
+    // Validate with decypher for diagnostics (R10)
+    let decypher_err = match decypher::parse(input) {
+        Ok(_) => None,
+        Err(e) => Some(format!("{:?}", e)),
+    };
 
     let mut parser = Parser::new(input);
-    parser.parse(params)
+    match parser.parse(params) {
+        Ok(pq) => Ok(pq),
+        Err(GliteError::Parse(msg)) => {
+            if let Some(d) = decypher_err {
+                Err(GliteError::Parse(format!("{}; decypher: {}", msg, d)))
+            } else {
+                Err(GliteError::Parse(msg))
+            }
+        },
+        Err(e) => Err(e),
+    }
 }
 
 struct Parser<'a> {
@@ -174,6 +185,7 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> Option<char> { self.chars.get(self.pos).copied() }
+    #[allow(dead_code)]
     fn peek_next(&self, n: usize) -> Option<char> { self.chars.get(self.pos+n).copied() }
     fn consume(&mut self) -> Option<char> {
         let c = self.chars.get(self.pos).copied();
@@ -347,7 +359,7 @@ impl<'a> Parser<'a> {
     fn try_parse_edge_pattern(&mut self) -> Result<Option<PatternEdge>> {
         self.skip_ws();
         let start = self.pos;
-        let mut direction = Direction::Undirected;
+        let direction;
         // Check leading '<'
         let mut has_left_arrow = false;
         if self.peek() == Some('<') {
@@ -364,6 +376,8 @@ impl<'a> Parser<'a> {
         let mut edge_type = None;
         let mut properties = HashMap::new();
         let mut is_variable_length = false;
+        let mut var_len_min: Option<usize> = None;
+        let mut var_len_max: Option<usize> = None;
         if self.peek() == Some('[') {
             self.consume();
             self.skip_ws();
@@ -382,12 +396,54 @@ impl<'a> Parser<'a> {
             // Now inner contains inside brackets
             // Parse inner separately
             let inner_str = self.chars[content_start..self.pos].iter().collect::<String>();
-            // Mark variable length
+            // Mark variable length and parse bounds like *1..5, *..5, *2.., *
+            let mut cleaned_inner = inner_str.clone();
             if inner_str.contains('*') {
                 is_variable_length = true;
+                // extract bounds after '*'
+                if let Some(star_idx) = inner_str.find('*') {
+                    let after = inner_str[star_idx+1..].trim_start();
+                    // Find end of bounds (digits and dots)
+                    let mut bound_len = 0usize;
+                    for c in after.chars() {
+                        if c.is_ascii_digit() || c=='.' { bound_len += c.len_utf8(); } else { break; }
+                    }
+                    let bound_str = after[..bound_len].trim();
+                    if !bound_str.is_empty() {
+                        // parse like "1..5", "1..", "..5", "3"
+                        if bound_str.contains("..") {
+                            let parts: Vec<&str> = bound_str.split("..").collect();
+                            let min_s = parts[0].trim();
+                            let max_s = if parts.len()>1 { parts[1].trim() } else { "" };
+                            if !min_s.is_empty() {
+                                if let Ok(v) = min_s.parse::<usize>() { var_len_min = Some(v); }
+                            }
+                            if !max_s.is_empty() {
+                                if let Ok(v) = max_s.parse::<usize>() { var_len_max = Some(v); }
+                            }
+                            if var_len_min.is_none() && var_len_max.is_some() { var_len_min = Some(1); }
+                            if var_len_min.is_none() && var_len_max.is_none() { var_len_min = Some(1); var_len_max = Some(10); }
+                        } else {
+                            if let Ok(v) = bound_str.parse::<usize>() {
+                                var_len_min = Some(v);
+                                var_len_max = Some(v);
+                            }
+                        }
+                    } else {
+                        // bare "*" -> 1..10 default
+                        var_len_min = Some(1);
+                        var_len_max = Some(10);
+                    }
+                    if var_len_min.is_none() { var_len_min = Some(1); }
+                    if var_len_max.is_none() { var_len_max = Some(10); }
+                    // Build cleaned inner without the *bounds
+                    let before = &inner_str[..star_idx];
+                    let after_remainder = &after[bound_len..];
+                    cleaned_inner = format!("{}{}", before, after_remainder);
+                }
             }
             // Simple parsing for inner
-            self.parse_edge_inner(&inner_str, &mut variable, &mut edge_type, &mut properties)?;
+            self.parse_edge_inner(&cleaned_inner, &mut variable, &mut edge_type, &mut properties)?;
             // expect ']'
             if self.peek() == Some(']') { self.consume(); } else { return Err(GliteError::Parse("expected ']'".into())) }
         }
@@ -408,7 +464,7 @@ impl<'a> Parser<'a> {
             (true, true) => Direction::Undirected, // though <--> unusual
             (false, false) => Direction::Undirected,
         };
-        Ok(Some(PatternEdge{ variable, edge_type, properties, direction, is_variable_length, weight_property: None }))
+        Ok(Some(PatternEdge{ variable, edge_type, properties, direction, is_variable_length, var_len_min, var_len_max, weight_property: None }))
     }
 
     fn parse_edge_inner(&mut self, inner: &str, variable: &mut Option<String>, edge_type: &mut Option<String>, props: &mut HashMap<String, Expr>) -> Result<()> {
@@ -451,7 +507,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect_char('(')?;
         // Capture until matching ')'
-        let start = self.pos;
+        let _start = self.pos;
         let mut depth = 1;
         let mut content = String::new();
         while let Some(c) = self.peek() {
@@ -740,12 +796,98 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_shortest_path_expr(&mut self, preset_var: Option<String>) -> Result<ShortestPathSpec> {
-        // expect shortestPath '(' ... ')'
+        // expect shortestPath '(' ... ')' with optional weight/algorithm args: shortestPath((a)-[:TYPE*]->(b), 'weight', 'bidirectional')
         self.consume_str_case_insensitive("shortestPath");
         self.expect_char('(')?;
         self.skip_ws();
         // Inside: (a)-[:KNOWS*]->(b) or (a)-[*]-(b)
         let path = self.parse_pattern_path()?;
+        self.skip_ws();
+        // Optional comma-separated extra args: weight prop and/or algorithm
+        let mut weight_prop: Option<String> = None;
+        let mut algorithm = PathAlgorithm::Bfs;
+        // Check for additional args after pattern: ',' weight ',' algo
+        if self.peek() == Some(',') {
+            self.consume();
+            self.skip_ws();
+            // Parse weight prop: could be string literal 'weight' or identifier or $param
+            if self.peek() == Some('\'') || self.peek() == Some('"') {
+                let w = self.parse_string_literal()?;
+                if !w.is_empty() {
+                    weight_prop = Some(w.clone());
+                    algorithm = PathAlgorithm::Dijkstra;
+                }
+            } else if self.peek() == Some('$') {
+                self.consume();
+                let p = self.parse_identifier()?;
+                weight_prop = Some(p.clone());
+                algorithm = PathAlgorithm::Dijkstra;
+            } else if self.peek().map(|c| c.is_alphabetic() || c=='_').unwrap_or(false) {
+                // could be weight identifier or algorithm name
+                let ident = self.parse_identifier()?;
+                let lower = ident.to_lowercase();
+                if lower == "bidirectional" || lower == "bfs" || lower == "dijkstra" {
+                    algorithm = match lower.as_str() {
+                        "bidirectional" => PathAlgorithm::Bidirectional,
+                        "dijkstra" => PathAlgorithm::Dijkstra,
+                        _ => PathAlgorithm::Bfs,
+                    };
+                    // if dijkstra without weight, default weight prop "weight"
+                    if algorithm == PathAlgorithm::Dijkstra && weight_prop.is_none() {
+                        weight_prop = Some("weight".to_string());
+                    }
+                } else {
+                    weight_prop = Some(ident.clone());
+                    algorithm = PathAlgorithm::Dijkstra;
+                }
+            }
+            self.skip_ws();
+            // Check for second optional arg (algorithm) if first was weight
+            if self.peek() == Some(',') {
+                self.consume();
+                self.skip_ws();
+                if self.peek().map(|c| c.is_alphabetic() || c=='_').unwrap_or(false) {
+                    let ident2 = self.parse_identifier()?;
+                    let lower2 = ident2.to_lowercase();
+                    algorithm = match lower2.as_str() {
+                        "bidirectional" => PathAlgorithm::Bidirectional,
+                        "dijkstra" => PathAlgorithm::Dijkstra,
+                        "bfs" => PathAlgorithm::Bfs,
+                        _ => algorithm,
+                    };
+                    if algorithm == PathAlgorithm::Dijkstra && weight_prop.is_none() {
+                        weight_prop = Some("weight".to_string());
+                    }
+                } else if self.peek() == Some('\'') || self.peek() == Some('"') {
+                    let a = self.parse_string_literal()?;
+                    let lower = a.to_lowercase();
+                    algorithm = match lower.as_str() {
+                        "bidirectional" => PathAlgorithm::Bidirectional,
+                        "dijkstra" => PathAlgorithm::Dijkstra,
+                        _ => PathAlgorithm::Bfs,
+                    };
+                }
+            }
+        } else {
+            // No extra args: try to infer weight from edge properties (e.g., [:TYPE {weight: 1}])
+            // Already captured in path.edges[0].weight_property ? check edge props
+            if !path.edges.is_empty() {
+                let ep = &path.edges[0];
+                // If edge has property named weight or cost etc, use it?
+                // Alternatively, if inner edge specified weight_property via bracket syntax we haven't captured.
+                // For now check if edge variable has weight_property set (currently not set)
+                if ep.weight_property.is_some() {
+                    weight_prop = ep.weight_property.clone();
+                    algorithm = PathAlgorithm::Dijkstra;
+                }
+                // Also detect algorithm hint in raw input near shortestPath (e.g., "algo=bidirectional")
+                // Simple heuristic: if original input contains "bidirectional" case-insensitive, use it
+                if self.input.to_lowercase().contains("bidirectional") {
+                    algorithm = PathAlgorithm::Bidirectional;
+                }
+            }
+        }
+        self.skip_ws();
         self.expect_char(')')?;
         // Extract start/end vars, edge type/direction
         if path.nodes.len() < 2 { return Err(GliteError::Parse("shortestPath requires at least two nodes".into())) }
@@ -753,11 +895,12 @@ impl<'a> Parser<'a> {
         let end_var = path.nodes.last().unwrap().variable.clone().unwrap_or_else(|| "b".to_string());
         let edge_type = if !path.edges.is_empty() { path.edges[0].edge_type.clone() } else { None };
         let direction = if !path.edges.is_empty() { path.edges[0].direction.clone() } else { Direction::Undirected };
-        // Determine algorithm: if weighted property? For now BFS unless weight specified
-        // Check if edge has property indicating weight? We'll default to BFS, bidirectional as optimization requested but we will decide based on spec
-        // For MVP, use Bfs for unweighted, Dijkstra if weight prop present, Bidirectional for long paths (we can map Bidirectional as BFS bidirectional)
-        let algorithm = PathAlgorithm::Bfs;
-        Ok(ShortestPathSpec{ path_var: preset_var, start_var, end_var, edge_type, direction, weighted: false, weight_prop: None, algorithm })
+        let weighted = weight_prop.is_some();
+        // If weight specified but algorithm still Bfs, promote to Dijkstra
+        if weighted && algorithm == PathAlgorithm::Bfs {
+            algorithm = PathAlgorithm::Dijkstra;
+        }
+        Ok(ShortestPathSpec{ path_var: preset_var, start_var, end_var, edge_type, direction, weighted, weight_prop, algorithm })
     }
 
     fn try_parse_shortest_path_assignment(&mut self) -> Option<ShortestPathSpec> {
@@ -784,7 +927,7 @@ impl<'a> Parser<'a> {
 }
 
 fn parse_node_content(content: &str) -> Result<PatternNode> {
-    let mut s = content.trim();
+    let s = content.trim();
     let mut variable = None;
     let mut labels = vec![];
     let mut properties = HashMap::new();

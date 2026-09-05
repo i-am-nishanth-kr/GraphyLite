@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pygraphylite"
+version = "0.1.0"
+description = "Python bindings for GraphyLite (glite) embedded graph database — Cypher subset"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "GraphyLite" }]
+keywords = ["graph", "database", "cypher", "embedded", "redb"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.urls]
+Homepage = "https://github.com/anomalyco/opencode"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "crates/pygraphylite/Cargo.toml"
+module-name = "pygraphylite"
+bindings = "pyo3"

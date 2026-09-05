@@ -1,0 +1,15 @@
+[package]
+name = "pygraphylite"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for GraphyLite (glite) embedded graph database"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "pygraphylite"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+graphylite = { path = "../graphylite" }
+serde_json = "1.0"

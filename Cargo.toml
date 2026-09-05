@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/graphylite", "crates/glite"]
+members = ["crates/graphylite", "crates/glite", "crates/pygraphylite"]
 resolver = "2"
 
 [workspace.dependencies]
